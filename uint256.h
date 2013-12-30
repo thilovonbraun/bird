@@ -288,10 +288,20 @@ public:
 
     std::string GetHex() const
     {
-        char psz[sizeof(pn)*2 + 1];
-        for (int i = 0; i < sizeof(pn); i++)
-            sprintf(psz + i*2, "%02x", ((unsigned char*)pn)[sizeof(pn) - i - 1]);
-        return string(psz, psz + sizeof(pn)*2);
+		const int isize = (int)sizeof(pn);
+        char psz[isize * 2 +1];
+ //       for (size_t i = 0; i < sizeof(pn); i++)
+ //           sprintf_s(psz + i*2, size_psz, "%02x", ((unsigned char*)pn)[sizeof(pn) - i - 1]);
+		int b;
+		unsigned char *bp = (unsigned char *)pn;
+		for (int i = 0; i < isize; i++) {
+			b = bp[isize - i - 1] >>4;
+			psz[i*2]= (char)(55+b+(((b-10)>>31)&-7));
+			b = bp[isize - i - 1] & 0xF;
+			psz[i*2+1]= (char)(55+b+(((b-10)>>31)&-7));
+		}
+		psz[isize*2]=0;
+		return std::string(psz);
     }
 
     void SetHex(const char* psz)

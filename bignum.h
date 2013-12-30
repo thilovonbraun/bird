@@ -94,19 +94,19 @@ public:
 
     unsigned long getulong() const
     {
-        return BN_get_word(this);
+        return (unsigned long)BN_get_word(this);
     }
 
     unsigned int getuint() const
     {
-        return BN_get_word(this);
+        return (unsigned int)(BN_get_word(this));
     }
 
     int getint() const
     {
-        unsigned long n = BN_get_word(this);
+        unsigned long long n = BN_get_word(this);
         if (!BN_is_negative(this))
-            return (n > INT_MAX ? INT_MAX : n);
+            return (n > INT_MAX ? INT_MAX : (int)n);
         else
             return (n > INT_MAX ? INT_MIN : -(int)n);
     }
@@ -138,12 +138,12 @@ public:
             }
             *p++ = c;
         }
-        unsigned int nSize = p - (pch + 4);
+        unsigned int nSize = (unsigned int)(p - (pch + 4));
         pch[0] = (nSize >> 24) & 0xff;
         pch[1] = (nSize >> 16) & 0xff;
         pch[2] = (nSize >> 8) & 0xff;
         pch[3] = (nSize) & 0xff;
-        BN_mpi2bn(pch, p - pch, this);
+        BN_mpi2bn(pch, (int)(p - pch), this);
     }
 
     void setuint64(uint64 n)
@@ -165,12 +165,12 @@ public:
             }
             *p++ = c;
         }
-        unsigned int nSize = p - (pch + 4);
+        unsigned int nSize = (unsigned int)(p - (pch + 4));
         pch[0] = (nSize >> 24) & 0xff;
         pch[1] = (nSize >> 16) & 0xff;
         pch[2] = (nSize >> 8) & 0xff;
         pch[3] = (nSize) & 0xff;
-        BN_mpi2bn(pch, p - pch, this);
+        BN_mpi2bn(pch, (int)(p - pch), this);
     }
 
     void setuint256(uint256 n)
@@ -193,12 +193,12 @@ public:
             }
             *p++ = c;
         }
-        unsigned int nSize = p - (pch + 4);
+        unsigned int nSize = (unsigned int)(p - (pch + 4));
         pch[0] = (nSize >> 24) & 0xff;
         pch[1] = (nSize >> 16) & 0xff;
         pch[2] = (nSize >> 8) & 0xff;
         pch[3] = (nSize >> 0) & 0xff;
-        BN_mpi2bn(pch, p - pch, this);
+        BN_mpi2bn(pch, (int)(p - pch), this);
     }
 
     uint256 getuint256()
@@ -211,7 +211,7 @@ public:
         if (vch.size() > 4)
             vch[4] &= 0x7f;
         uint256 n = 0;
-        for (int i = 0, j = vch.size()-1; i < sizeof(n) && j >= 4; i++, j--)
+        for (int i = 0, j = (unsigned int)(vch.size()-1); i < sizeof(n) && j >= 4; i++, j--)
             ((unsigned char*)&n)[i] = vch[j];
         return n;
     }
@@ -219,13 +219,13 @@ public:
     void setvch(const std::vector<unsigned char>& vch)
     {
         std::vector<unsigned char> vch2(vch.size() + 4);
-        unsigned int nSize = vch.size();
+        unsigned int nSize = (unsigned int)(vch.size());
         vch2[0] = (nSize >> 24) & 0xff;
         vch2[1] = (nSize >> 16) & 0xff;
         vch2[2] = (nSize >> 8) & 0xff;
         vch2[3] = (nSize >> 0) & 0xff;
         reverse_copy(vch.begin(), vch.end(), vch2.begin() + 4);
-        BN_mpi2bn(&vch2[0], vch2.size(), this);
+        BN_mpi2bn(&vch2[0], (int)vch2.size(), this);
     }
 
     std::vector<unsigned char> getvch() const
@@ -248,7 +248,7 @@ public:
         if (nSize >= 1) vch[4] = (nCompact >> 16) & 0xff;
         if (nSize >= 2) vch[5] = (nCompact >> 8) & 0xff;
         if (nSize >= 3) vch[6] = (nCompact >> 0) & 0xff;
-        BN_mpi2bn(&vch[0], vch.size(), this);
+        BN_mpi2bn(&vch[0], (int)vch.size(), this);
         return *this;
     }
 
@@ -326,7 +326,7 @@ public:
         return ToString(16);
     }
 
-    unsigned int GetSerializeSize(int nType=0, int nVersion=VERSION) const
+    size_t GetSerializeSize(int nType=0, int nVersion=VERSION) const
     {
         return ::GetSerializeSize(getvch(), nType, nVersion);
     }

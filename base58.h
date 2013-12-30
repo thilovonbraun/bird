@@ -81,7 +81,7 @@ inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
                 return false;
             break;
         }
-        bnChar.setulong(p1 - pszBase58);
+        bnChar.setulong((unsigned long)(p1 - pszBase58));
         if (!BN_mul(&bn, &bn, &bn58, pctx))
             throw bignum_error("DecodeBase58 : BN_mul failed");
         bn += bnChar;

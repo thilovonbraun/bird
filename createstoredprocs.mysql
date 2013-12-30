@@ -1,6 +1,8 @@
 DROP PROCEDURE IF EXISTS GetBalanceDetails;
 DROP PROCEDURE IF EXISTS SetTxToSend;
 DROP PROCEDURE IF EXISTS GetSentTxStatus;
+DROP PROCEDURE IF EXISTS PruneTxInsideBlock;
+DROP PROCEDURE IF EXISTS PruneTxMultiBlock;
 DELIMITER //
 CREATE PROCEDURE GetBalanceDetails(IN BTCAddress CHAR(34))
 BEGIN
@@ -42,5 +44,53 @@ END //
 CREATE PROCEDURE GetSentTxStatus(IN txID INTEGER)
 BEGIN
   SELECT txStatus FROM TxToSend WHERE ID = txID;
+END //
+CREATE PROCEDURE PruneTxInsideBlock(IN iHeight INTEGER UNSIGNED)
+lab1:BEGIN
+  DECLARE bID INT;
+  DECLARE bHash BINARY(20);
+  DECLARE i INT;
+  IF iHeight<=0 THEN
+    LEAVE lab1;
+  END IF;
+  SELECT ID, hash, status INTO bID, bHash, i FROM ChainBlocks WHERE height=iHeight LIMIT 1;
+  IF bID IS NULL THEN
+    LEAVE lab1;
+  END IF;
+  IF i>=2 THEN
+    LEAVE lab1;
+  END IF;
+  DROP TEMPORARY TABLE IF EXISTS TempPurge1;
+  CREATE TEMPORARY TABLE TempPurge1 ENGINE=MEMORY AS (
+    SELECT ci.txN as ci_txN, ci.txInN as ci_txInN, ci.opN as ci_opN, ct.txN as ct_txN
+    FROM ChainTxIns ci, ChainTxs ct
+    WHERE ci.blockID=bID AND ct.blockID=bID AND ci.opHash=ct.txHash );
+  START TRANSACTION;
+  DELETE cto.* FROM ChainTxOuts cto INNER JOIN TempPurge1 tp ON (cto.blockID=bID AND cto.txN=tp.ct_txN AND cto.txOutN=tp.ci_opN);
+  DELETE cti.* FROM ChainTxIns cti INNER JOIN TempPurge1 tp ON (cti.blockID=bID AND cti.txN=tp.ci_txN AND cti.txInN=tp.ci_txInN);
+  UPDATE ChainBlocks SET status=2 WHERE ID=bID;
+  COMMIT;
+END //
+CREATE PROCEDURE PruneTxMultiBlock(IN Height_Start INTEGER UNSIGNED, IN Height_End INTEGER UNSIGNED)
+lab2:BEGIN
+  DECLARE i INT;
+  IF Height_Start<=0 OR Height_End<Height_Start THEN
+    LEAVE lab2;
+  END IF;
+  SELECT COUNT(*) INTO i FROM ChainBlocks WHERE height>=Height_Start AND height<=Height_End AND status>3;
+  IF i>0 THEN
+    LEAVE lab2;
+  END IF;
+  DROP TEMPORARY TABLE IF EXISTS TempPurge2;
+  CREATE TEMPORARY TABLE TempPurge2 ENGINE=MEMORY AS (
+    SELECT ci.blockID as ci_bID, ci.txN as ci_txN, ci.txInN as ci_txInN, ci.opN as ci_opN, ct.blockID as ct_bID, ct.txN as ct_txN
+    FROM ChainTxIns ci, ChainTxs ct
+    INNER JOIN ChainBlocks cb ON (cb.ID=ct.blockID)
+    WHERE ci.opHash=ct.txHash AND cb.height>=Height_Start AND cb.height<=Height_End);
+  START TRANSACTION;
+  DELETE cto.* FROM ChainTxOuts cto INNER JOIN TempPurge2 tp ON (cto.blockID=tp.ct_bID AND cto.txN=tp.ct_txN AND cto.txOutN=tp.ci_opN);
+  DELETE cti.* FROM ChainTxIns cti INNER JOIN TempPurge2 tp ON (cti.blockID=tp.ci_bID AND cti.txN=tp.ci_txN AND cti.txInN=tp.ci_txInN);
+  UPDATE ChainBlocks SET status=3 WHERE height>=Height_Start AND height<=Height_End AND status<3;
+  COMMIT;
 END //
 DELIMITER ;

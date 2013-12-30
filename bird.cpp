@@ -1,9 +1,11 @@
-// Copyright (c) 2012 Thilo von Braun
+// Copyright (c) 2012-2013 Thilo von Braun
 // Distributed under the EUPL v1.1 software license, see the accompanying
 // file license.txt or http://www.osor.eu/eupl/european-union-public-licence-eupl-v.1.1
+// BiRD.cpp : Defines the entry point for the application.
+//
 
-#include "StdAfx.h"
-#include "bird.h"
+#include "stdafx.h"
+#include "BiRD.h"
 #include "bird_TCP.h"
 #define MYSQLPP_SSQLS_NO_STATICS
 #include "dbBTC.h"
@@ -11,11 +13,8 @@
 #include "Shobjidl.h"
 #pragma comment (lib, "shlwapi.lib")
 
-// #include "Commdlg.h"
-
 // Global Variables:
 HINSTANCE hInst;								// current instance
-HANDLE hMutexDBLock;							// mutex database locks
 HACCEL hAccelTable;
 TCHAR szTitle[MAX_LOADSTRING];					// The title bar text
 TCHAR szWindowClass[MAX_LOADSTRING];			// the main window class name
@@ -35,12 +34,12 @@ dbBTC mydb;
 TCHAR szINIFile[MAX_PATH];
 
 // Worker threads communication variables
-Concurrency::concurrent_queue<BTCMessage> cqInvMsg, cqBlockMsg, cqTxMsg;
+Concurrency::concurrent_queue<BTCMessage *> cqInvMsg, cqBlockMsg, cqTxMsg;
 
 // Memorize if threads are running
-HANDLE bThreadRunning[5];  // 0: InvMsg, 1: BlockMsg, 2: TxMsg, 3: dbConnect, 4: SQLconfirm
+HANDLE bThreadRunning[6];  // 0: InvMsg, 1: BlockMsg, 2: TxMsg, 3: dbConnect, 4: SQLconfirm, 5: MultiPrune
 // Flags to abort thread
-bool bThreadAbort[5];
+bool bThreadAbort[6];
 
 // Forward declarations of functions included in this code module:
 ATOM				MyRegisterClass(HINSTANCE hInstance);
@@ -51,19 +50,18 @@ INT_PTR CALLBACK	About(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK	DumpDB_Dlg(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK	LoadDB_Dlg(HWND, UINT, WPARAM, LPARAM);
 
-int APIENTRY _tWinMain(HINSTANCE hInstance,
-                     HINSTANCE hPrevInstance,
-                     LPTSTR    lpCmdLine,
-                     int       nCmdShow)
+int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
+                     _In_opt_ HINSTANCE hPrevInstance,
+                     _In_ LPTSTR    lpCmdLine,
+                     _In_ int       nCmdShow)
 {
 	UNREFERENCED_PARAMETER(hPrevInstance);
 	UNREFERENCED_PARAMETER(lpCmdLine);
-
 	MSG msg;
 
 	// Initialize global strings
 	LoadString(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-	LoadString(hInstance, IDC_UBICARD, szWindowClass, MAX_LOADSTRING);
+	LoadString(hInstance, IDC_BIRD, szWindowClass, MAX_LOADSTRING);
 	GetModuleFileName(NULL, szINIFile, MAX_PATH);
 	PTCHAR p = _tcsrchr(szINIFile, '\\');	// last backslash
 	if (p!=NULL) {	// found a backslash
@@ -79,7 +77,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 		return FALSE;
 	}
 
-	hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_UBICARD));
+	hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_BIRD));
 
 	// Main message loop:
 	BOOL bgMsg;
@@ -94,7 +92,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 		}
 	}
 	mysqlpp::Connection::thread_end();
-	CloseHandle(hMutexDBLock);
+
 	if (bgMsg==-1)
 		return (int)GetLastError();
 	else
@@ -102,14 +100,17 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 }
 
 //
-// DoNonUserMessages
+// FUNCTION: DoNonUserMessages
 //
-// Process all awaiting non WM_USER messages using PeekMessage
-// Returns: true if WM_QUIT message retrieved
+// PURPOSE : Process all awaiting non WM_USER messages using PeekMessage
+//
+// RETURNS : true if WM_QUIT message retrieved
 //
 bool DoNonUserMessages(void)
 {
 	MSG msg;
+	BOOST_LOG_TRIVIAL(trace) << "DoNonUserMessages invoked";
+
 	while ( PeekMessage(&msg, NULL, 0, WM_USER-1, PM_REMOVE|PM_NOYIELD))
 	{
 		if (msg.message == WM_QUIT)
@@ -124,17 +125,74 @@ bool DoNonUserMessages(void)
 }
 
 //
+// FUNCTION: SetupLogging()
+//
+// PURPOSE : Setup logging with parameters from INI file
+//
+// RETURNS : true if successfull
+//
+bool SetUpLogging(void)
+{
+	TCHAR sTLoad[MAX_LOADSTRING];		// string holding private profile string
+	char szFileName[MAX_LOADSTRING*2];  // multibyte filename string
+	char szFormat[MAX_LOADSTRING*2];    // multibyte format string
+	const TCHAR szLog[]=L"log";
+
+	// get log settings from INI file
+	GetPrivateProfileString(szLog, L"file_name", L"bird02_%N.log", sTLoad, MAX_LOADSTRING, szINIFile);
+	WideCharToMultiByte(CP_ACP, 0, sTLoad, -1, szFileName, MAX_LOADSTRING*2, NULL, NULL);
+	GetPrivateProfileString(szLog, L"format", L"[%TimeStamp%] <%Severity%> %Message%", sTLoad, MAX_LOADSTRING, szINIFile);
+	WideCharToMultiByte(CP_ACP, 0, sTLoad, -1, szFormat, MAX_LOADSTRING*2, NULL, NULL);
+	INT iRotSize = GetPrivateProfileInt(szLog, L"rotation_size", 10485760, szINIFile);
+	INT iRotHour = GetPrivateProfileInt(szLog, L"time_based_rotation_hour", -1, szINIFile);
+	if (iRotHour<-1 || iRotHour>23)
+		iRotHour=-1;					// if hour is not between -1..23, set it as -1 (time base rotation disabled)
+	INT iRotMin = GetPrivateProfileInt(szLog, L"time_based_rotation_minute", 0, szINIFile);
+	if (iRotMin<0 || iRotMin>59)
+		iRotMin=0;
+	INT iRotSec = GetPrivateProfileInt(szLog, L"time_based_rotation_second", 0, szINIFile);
+	if (iRotSec<0 || iRotSec>59)
+		iRotSec=0;
+
+	// define severity template
+	boost::log::register_simple_formatter_factory< boost::log::trivial::severity_level, char >("Severity");
+	// add file log
+	if (iRotHour>=0) {					// with time based rotation
+		boost::log::add_file_log(
+			boost::log::keywords::file_name = szFileName,
+			boost::log::keywords::rotation_size = iRotSize,
+			boost::log::keywords::time_based_rotation = boost::log::sinks::file::rotation_at_time_point((unsigned char)iRotHour, (unsigned char)iRotMin, (unsigned char)iRotSec),
+			boost::log::keywords::format = szFormat,
+			boost::log::keywords::open_mode = std::ios_base::app | std::ios_base::out,
+			boost::log::keywords::auto_flush = true);
+	}
+	else								// without time based rotation
+	{
+		boost::log::add_file_log(
+			boost::log::keywords::file_name = szFileName,
+			boost::log::keywords::rotation_size = iRotSize,
+			boost::log::keywords::format = szFormat,
+			boost::log::keywords::open_mode = std::ios_base::app | std::ios_base::out,
+			boost::log::keywords::auto_flush = true);
+	}
+
+	// set severity level filter
+	iRotSize = GetPrivateProfileInt(szLog, L"level", 3, szINIFile);
+	if (iRotSize<0 || iRotSize>5)   // check range of log level
+		iRotSize=3;					// if out of range, set default 3 (=warning & above)
+	boost::log::core::get()->set_filter( boost::log::trivial::severity >= iRotSize);
+
+	// finalize logging setup
+	boost::log::add_common_attributes();
+	BOOST_LOG_TRIVIAL(info) << "Bird 0.2.0 Logging started";
+	return true;
+}
+
+
+//
 //  FUNCTION: MyRegisterClass()
 //
 //  PURPOSE: Registers the window class.
-//
-//  COMMENTS:
-//
-//    This function and its usage are only necessary if you want this code
-//    to be compatible with Win32 systems prior to the 'RegisterClassEx'
-//    function that was added to Windows 95. It is important to call this function
-//    so that the application will get 'well formed' small icons associated
-//    with it.
 //
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
@@ -147,10 +205,10 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
 	wcex.cbClsExtra		= 0;
 	wcex.cbWndExtra		= 0;
 	wcex.hInstance		= hInstance;
-	wcex.hIcon			= LoadIcon(hInstance, MAKEINTRESOURCE(IDI_UBICARD));
+	wcex.hIcon			= LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BIRD));
 	wcex.hCursor		= LoadCursor(NULL, IDC_ARROW);
 	wcex.hbrBackground	= (HBRUSH)(COLOR_WINDOW+1);
-	wcex.lpszMenuName	= MAKEINTRESOURCE(IDC_UBICARD);
+	wcex.lpszMenuName	= MAKEINTRESOURCE(IDC_BIRD);
 	wcex.lpszClassName	= szWindowClass;
 	wcex.hIconSm		= LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
 
@@ -175,18 +233,16 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	   bThreadRunning[i] = NULL;
 	   bThreadAbort[i] = false;
    }
-   // Create mutex object for database locks
-   //hMutexDBLock = CreateMutex(NULL, FALSE, NULL);
-   //if (hMutexDBLock == NULL) {
-	  // OutputDebugString(L"CreateMutex error");
-	  // return FALSE;
-   //}
+
+   if (!SetUpLogging())
+	   return FALSE;
 
    hWndMain = CreateWindow(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
       CW_USEDEFAULT, 0, 435, 405, NULL, NULL, hInstance, NULL);
 
    if (!hWndMain)
       return FALSE;
+   BOOST_LOG_TRIVIAL(debug) << "Main window created";
    if (CreateChildsInMain(hWndMain)<0)
 	   return FALSE;
    ShowWindow(hWndMain, nCmdShow);
@@ -195,7 +251,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    SetFocus(GetDlgItem(hWndMain, IDC_EDITSQL));
    EnableWindow(GetDlgItem(hWndMain, IDC_BTNBTCCONNECT), FALSE);
    UpdateWindow(hWndMain);
-
+   BOOST_LOG_TRIVIAL(trace) << "Init instance finished";
    return TRUE;
 }
 
@@ -215,34 +271,34 @@ void PaintMainWindow(HWND hWnd)
 	SetTextAlign(hdc, TA_LEFT | TA_BASELINE);
 	LoadString(hInst, IDS_IPSQL, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 35+15, sz1, stlen);
+		TextOut(hdc, 15, 35+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_IP, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 35+15+70, sz1, stlen);
+		TextOut(hdc, 15, 35+15+70, sz1, (int)stlen);
 	LoadString(hInst, IDS_DBSTATUS, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 35+15+35, sz1, stlen);
+		TextOut(hdc, 15, 35+15+35, sz1, (int)stlen);
 	LoadString(hInst, IDS_SOCKETSTATUS, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 35+15+105, sz1, stlen);
+		TextOut(hdc, 15, 35+15+105, sz1, (int)stlen);
 	LoadString(hInst, IDS_COUNT, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 155+70+15, sz1, stlen);
+		TextOut(hdc, 15, 155+70+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_SLASH, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 140-7, 155+70+15, sz1, stlen);
+		TextOut(hdc, 140-7, 155+70+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_BLOCKS, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 202, 155+70+15, sz1, stlen);
+		TextOut(hdc, 202, 155+70+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_PROCESSED, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 215+70+15, sz1, stlen);
+		TextOut(hdc, 15, 215+70+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_NODESTATUS, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 183+70+15, sz1, stlen);
+		TextOut(hdc, 15, 183+70+15, sz1, (int)stlen);
 	LoadString(hInst, IDS_TXUNCONFIRMED, sz1, MAX_LOADSTRING);
 	if (SUCCEEDED(StringCchLength(sz1, MAX_LOADSTRING, &stlen)))
-		TextOut(hdc, 15, 238+70+15, sz1, stlen);
+		TextOut(hdc, 15, 238+70+15, sz1, (int)stlen);
 
 	// TODO: Add any drawing code here...
 	EndPaint(hWnd, &ps);
@@ -255,7 +311,9 @@ void PaintMainWindow(HWND hWnd)
 //
 DWORD WINAPI Thread_DoDBConnect(LPVOID lParam)
 {
+//	mysqlpp::Connection::thread_start();
 	PostMessage(hWndMain, myMsg_ThreadFinished, mydb.SetupConnectionPool(), WT_DBConnect);	// post message when ConnectionPool setup returns
+//	mysqlpp::Connection::thread_end();
 	return 0;
 }
 
@@ -265,7 +323,9 @@ bool ProcessBtnSQLConnect(WPARAM wParam)
 	if (mydb.IsConnected()) {	// user wants to disconnect now
 		bThreadAbort[WT_InvMsg]=bThreadAbort[WT_BlockMsg]=true;
 		bThreadAbort[WT_TxMsg]=bThreadAbort[WT_DBConfirm]=true;		// signal thread abortion
+		bThreadAbort[WT_DBMultiPrune]=true;
 		EnableWindow(hCtrl, FALSE);									// disable button as long as we wait for threads to finish
+		BOOST_LOG_TRIVIAL(info) << "Disconnecting from database";
 		PostMessage(hWndMain, myMsg_WaitForDBDisconnect, wParam, 0);
 	}
 	else {	// user wants to connect
@@ -274,6 +334,8 @@ bool ProcessBtnSQLConnect(WPARAM wParam)
 		GetWindowText(GetDlgItem(hWndMain, IDC_EDITSQL), sTLoad, MAX_LOADSTRING);	// get text from control
 		WideCharToMultiByte(CP_ACP, 0, sTLoad, -1, sServer, MAX_LOADSTRING*2, NULL, NULL);
 		mydb.SetServer(sServer);
+		BOOST_LOG_TRIVIAL(info) << "Setting up thread to connect to " << sServer;
+
 		// lengthy operation can follow, do it in a worker thread
 		if (bThreadRunning[WT_DBConnect]=CreateThread(NULL, 0, Thread_DoDBConnect, 0, 0, NULL)) {
 			EnableWindow(hCtrl, FALSE);	// disable button as long as thread runs
@@ -288,24 +350,27 @@ bool ProcessBtnSQLConnect(WPARAM wParam)
 // Returns true if processing could be done, false otherwise (e.g. thread creation failed)
 bool ProcessDbConnectFinished(BOOL bConnected)
 {
+	BOOST_LOG_TRIVIAL(trace) << "Processing db connection...";
+
 	if (bConnected) {
 	try {
 		mysqlpp::Connection* cp = mydb.GrabConnection();
 		if (cp==NULL) {
-			cerr << "MySQL++ grab connection failed!\n";
+			BOOST_LOG_TRIVIAL(error) << "MySQL++ grab connection failed!";
 			bConnected=false;
 		}
-        if (!cp->thread_aware()) {
-            cerr << "MySQL++ wasn't built with thread awareness!\n";
-            bConnected=false;
-        }
-		else
-			cerr << "MySQL++ is thread aware.\n";
-        mydb.ReleaseConnection(cp);
+		else {
+			if (!cp->thread_aware()) {
+				BOOST_LOG_TRIVIAL(error) << "MySQL++ wasn't built with thread awareness!";
+				bConnected=false;
+			}
+			else
+				BOOST_LOG_TRIVIAL(info) << "MySQL++ is thread aware.";
+		}
+        mydb.ReleaseConnection(cp);		
     }
     catch (mysqlpp::Exception& e) {
-        cerr << "Failed to set up initial pooled connection: " <<
-                e.what() << endl;
+   		BOOST_LOG_TRIVIAL(error) << "Failed to set up initial pooled connection: " << e.what();
         bConnected=false;
     }
 	}
@@ -324,27 +389,37 @@ bool ProcessDbConnectFinished(BOOL bConnected)
 		if (!bThreadRunning[WT_InvMsg]) {
 			cqInvMsg.clear();
 			bThreadAbort[WT_InvMsg]=false;
+			BOOST_LOG_TRIVIAL(info) << "Creating thread to process 'inv' messages";
 			if (bThreadRunning[WT_InvMsg] = CreateThread(NULL, 0, Thread_DoProcessInvMsg, 0, 0, NULL))
 				SetThreadPriority(bThreadRunning[WT_InvMsg], THREAD_PRIORITY_NORMAL);
 		}
 		if (!bThreadRunning[WT_BlockMsg]) {
 			cqBlockMsg.clear();
 			bThreadAbort[WT_BlockMsg]=false;
+			BOOST_LOG_TRIVIAL(info) << "Creating thread to process 'block' messages";
 			if (bThreadRunning[WT_BlockMsg] = CreateThread(NULL, 0, Thread_DoProcessBlockMsg, 0, 0, NULL))
 				SetThreadPriority(bThreadRunning[WT_BlockMsg], THREAD_PRIORITY_NORMAL);
 		}
 		if (!bThreadRunning[WT_TxMsg]) {
 			cqTxMsg.clear();
 			bThreadAbort[WT_TxMsg]=false;
+			BOOST_LOG_TRIVIAL(info) << "Creating thread to process 'tx' messages";
 			if (bThreadRunning[WT_TxMsg] = CreateThread(NULL, 0, Thread_DoProcessTxMsg, 0, 0, NULL))
 				SetThreadPriority(bThreadRunning[WT_TxMsg], THREAD_PRIORITY_NORMAL);
 		}
 		if (!bThreadRunning[WT_DBConfirm]) {
 			bThreadAbort[WT_DBConfirm]=false;
+			BOOST_LOG_TRIVIAL(info) << "Creating thread to build UTXO set";
 			if (bThreadRunning[WT_DBConfirm] = CreateThread(NULL, 0, Thread_DoBlockConfirms, 0, 0, NULL))
 				SetThreadPriority(bThreadRunning[WT_DBConfirm], THREAD_PRIORITY_NORMAL);
 		}
-		return bThreadRunning[WT_InvMsg] && bThreadRunning[WT_BlockMsg] && bThreadRunning[WT_TxMsg] && bThreadRunning[WT_DBConfirm];
+		if (!bThreadRunning[WT_DBMultiPrune]) {
+			bThreadAbort[WT_DBMultiPrune]=false;
+			BOOST_LOG_TRIVIAL(info) << "Creating thread to do multi pruning";
+			if (bThreadRunning[WT_DBMultiPrune] = CreateThread(NULL, 0, Thread_DoMultiBlockPrunes, 0, 0, NULL))
+				SetThreadPriority(bThreadRunning[WT_DBMultiPrune], THREAD_PRIORITY_NORMAL);
+		}
+		return bThreadRunning[WT_InvMsg] && bThreadRunning[WT_BlockMsg] && bThreadRunning[WT_TxMsg] && bThreadRunning[WT_DBConfirm] && bThreadRunning[WT_DBMultiPrune];
 	}
 	else {	// unable to connect to database
 		LoadString(hInst, IDS_SS_FAILED, sz1, MAX_LOADSTRING);		// report to user about failed connection attempt
@@ -401,7 +476,7 @@ void ProcessBtnBTCConnect()
 //
 //  PURPOSE:  Processes messages for the main window.
 //
-//  WM_COMMAND	- process the application menu & buttons
+//  WM_COMMAND	- process the application menu
 //  WM_PAINT	- Paint the main window
 //  WM_DESTROY	- post a quit message and return
 //
@@ -447,12 +522,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			break;	// invalid lParam passed, ignore this message
 		bThreadRunning[lParam]=NULL;
 		bThreadAbort[lParam]=false;
+		BOOST_LOG_TRIVIAL(trace) << "Thread "<< lParam << " finished";
 
 		switch (lParam)
 		{
 		case WT_DBConnect:
 			mysqlpp::Connection::thread_start();		// main thread did not make connection pool
-			ProcessDbConnectFinished(wParam);
+			ProcessDbConnectFinished((BOOL)wParam);
 			break;
 		}
 		break;
@@ -493,16 +569,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case myMsg_BlockProcessed: // worker thread finished processing a block
-		{	mysqlpp::Connection* my_conn = mydb.GrabConnection();
-			mydb.CheckHeights(my_conn);													// check blocks with unknown heights
-			int iBestHeight=mydb.GetBestHeightKnown(my_conn);
+		{	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+		    if (my_conn==NULL)
+				break;			// GrabConnection failed
+			BIRDDB_Query q = my_conn->query();
+			mydb.CheckHeights(q);													// check blocks with unknown heights
+			int iBestHeight=mydb.GetBestHeight(q);
+			int iMaxHeight=mydb.GetMaxHeightKnown(q);
 			if (BTCnode.GetNodeStatus()==4 && iBestHeight>=BTCnode.Peer_BlockHeight) {	// we were uploading block chain and now get to same height as peer --> we're now "up-to-date"
 				BTCnode.IncNodeStatus();
 				PostMessage(hWndMain, myMsg_ProcessNodeStatus, 0, MsgREPAINT);
 			}
 			if (iBestHeight>=BTCnode.Peer_AskedBlockHeight) {	// ask next set of blocks if previous set is finished (also when we're "up-to-date", cause long download delay can cause missing blocks)
 				uint256 hash_start;
-				if (mydb.GetBlockHashFromHeight(my_conn, iBestHeight, hash_start)) {
+				if (mydb.GetBlockHashFromHeight(q, iBestHeight, hash_start)) {
 					if (BTCnode.SendMsg_GetBlocks(hash_start, uint256(0)))
 						BTCnode.Peer_AskedBlockHeight+=500;			// getblocks msg succeeded to ask up to 500 blocks more
 				}
@@ -510,14 +590,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			TCHAR szStaticText[10];
 			_itow_s(iBestHeight, szStaticText, 10, 10);
 			SetWindowText(hStaticCurBlock,szStaticText);
-			if (iBestHeight>BTCnode.Peer_BlockHeight)
-				BTCnode.Peer_BlockHeight=iBestHeight;					// we got better block then initial block height in version msg
+			if (iMaxHeight>BTCnode.Peer_BlockHeight)
+				BTCnode.Peer_BlockHeight=iMaxHeight;					// we got better block then initial block height in version msg
 			_itow_s(BTCnode.Peer_BlockHeight, szStaticText, 10, 10);
 			SetWindowText(hStaticMaxBlock,szStaticText);
-			iBestHeight = mydb.GetSafeHeight(my_conn);
+			iBestHeight = mydb.GetSafeHeight(q);
 			_itow_s(iBestHeight, szStaticText, 10, 10);
 			SetWindowText(hStaticProcessedBlock,szStaticText);
-			iBestHeight = mydb.NrTxUnconfirmed(my_conn);
+			iBestHeight = mydb.NrTxUnconfirmed(q);
 			_itow_s(iBestHeight, szStaticText, 10, 10);
 			SetWindowText(hStaticUnconfirmedTxs,szStaticText);
 			mydb.ReleaseConnection(my_conn);
@@ -553,17 +633,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return DefWindowProc(hWnd, message, wParam, lParam);
 		}
 		break;
-
 	case WM_TIMER:	// ping timer or stalled connection check
 		{
-			mysqlpp::Connection* my_conn = mydb.GrabConnection();
-			int iBestHeight=mydb.GetBestHeightKnown(my_conn);
+			BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+			if (my_conn==NULL)
+				break;			// GrabConnection failed
+			BIRDDB_Query q = my_conn->query();
+			int iBestHeight=mydb.GetBestHeight(q);
 			if (iBestHeight==BTCnode.iTimerPreviousBlockHeight) {	// stalled connection
 				if (BTCnode.GetNodeStatus()>4) 		// up-to-date chain ? 
-					iBestHeight=mydb.GetSafeHeight(my_conn);	// re-ask everything from safe height (to prevent stall in block fork)
+					iBestHeight=mydb.GetSafeHeight(q);	// re-ask everything from safe height (to prevent stall in block fork)
 				if (iBestHeight>0) {
 					uint256 h1;
-					mydb.GetBlockHashFromHeight(my_conn, iBestHeight, h1);
+					mydb.GetBlockHashFromHeight(q, iBestHeight, h1);
 					BTCnode.SendMsg_GetBlocks(h1, uint256(0) );
 				}
 			}
@@ -850,7 +932,7 @@ void ShowError(int iError, int iInformation)
 
 void ShowError(int iError, TCHAR *szInfo)
 {
-	int i=wcslen(szInfo);
+	size_t i=wcslen(szInfo);
 	TCHAR *szText = new TCHAR[MAX_LOADSTRING+i];
 	TCHAR szTextRaw[MAX_LOADSTRING];
 	TCHAR szTitle[MAX_LOADSTRING];
@@ -872,7 +954,7 @@ void ShowError(int iError, const char *szInfo)
 	TCHAR szTitle[MAX_LOADSTRING];
 	LoadString(hInst, IDS_Err_Caption, szTitle, MAX_LOADSTRING);
 	LoadString(hInst, iError, szTextRaw, MAX_LOADSTRING);
-	swprintf_s(szText, MAX_LOADSTRING, szTextRaw, wcstring);
+	swprintf_s(szText, MAX_LOADSTRING+newsize, szTextRaw, wcstring);
 	MessageBox(hWndMain, szText, szTitle, MB_OK);
 	delete[] szText;
 	delete[] wcstring;

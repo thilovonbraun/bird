@@ -86,7 +86,7 @@ public:
     bool SetPrivKey(const CPrivKey& vchPrivKey)
     {
         const unsigned char* pbegin = &vchPrivKey[0];
-        if (!d2i_ECPrivateKey(&pkey, &pbegin, vchPrivKey.size()))
+        if (!d2i_ECPrivateKey(&pkey, &pbegin, (long)vchPrivKey.size()))
             return false;
         fSet = true;
         return true;
@@ -107,7 +107,7 @@ public:
     bool SetPubKey(const vector<unsigned char>& vchPubKey)
     {
         const unsigned char* pbegin = &vchPubKey[0];
-        if (!o2i_ECPublicKey(&pkey, &pbegin, vchPubKey.size()))
+        if (!o2i_ECPublicKey(&pkey, &pbegin, (long)vchPubKey.size()))
             return false;
         fSet = true;
         return true;
@@ -140,7 +140,7 @@ public:
     bool Verify(uint256 hash, const vector<unsigned char>& vchSig)
     {
         // -1 = error, 0 = bad sig, 1 = good
-        if (ECDSA_verify(0, (unsigned char*)&hash, sizeof(hash), &vchSig[0], vchSig.size(), pkey) != 1)
+        if (ECDSA_verify(0, (unsigned char*)&hash, sizeof(hash), &vchSig[0], (int)vchSig.size(), pkey) != 1)
             return false;
         return true;
     }

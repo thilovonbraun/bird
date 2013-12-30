@@ -7,9 +7,9 @@
 #define IDM_DUMPDB                              105
 #define IDM_LOADDB                              106
 #define IDM_EXIT                                107
-#define IDI_UBICARD                             201
+#define IDI_BIRD								200
 #define IDI_SMALL                               202
-#define IDC_UBICARD                             301
+#define IDC_BIRD                                301
 #define IDD_DUMPDB                              303
 #define IDD_LOADDB                              305
 #define IDD_DIALOG1                             306
@@ -17,7 +17,6 @@
 #define IDC_CHECKBOX1                           1001
 #define IDC_IPADDRESS1                          1001
 #define IDC_STATICPATH                          1002
-#define IDM__1                                  40000
 #define IDS_APP_TITLE                           40000
 #define IDM__SAVE_SETTINGS1                     40001
 #define IDS_CONNECT                             40001
@@ -63,3 +62,4 @@
 #define IDS_DS_SCANNING                         40038
 #define IDS_Err_Socket                          40039
 #define IDS_TXUNCONFIRMED                       40040
+#define IDS_Err_Mutex                           40041

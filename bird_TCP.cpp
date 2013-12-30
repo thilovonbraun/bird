@@ -1,7 +1,9 @@
-// Copyright (c) 2012 Thilo von Braun
+// Copyright (c) 2012, 2013 Thilo von Braun
 // Distributed under the EUPL v1.1 software license, see the accompanying
 // file license.txt or http://www.osor.eu/eupl/european-union-public-licence-eupl-v.1.1
-
+//
+// Ver. 0.2.0
+// 
 #include "StdAfx.h"
 #include "bird.h"
 #include "bird_TCP.h"
@@ -12,22 +14,21 @@
 
 extern dbBTC mydb;
 extern BTCtcp BTCnode;
-extern Concurrency::concurrent_queue<BTCMessage> cqInvMsg, cqBlockMsg, cqTxMsg;
+extern Concurrency::concurrent_queue<BTCMessage *> cqInvMsg, cqBlockMsg, cqTxMsg;
 
 uint256 hashGenesisBlock("0x000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
 
-unsigned char pMessageStartStd[4]={0xF9, 0xBE, 0xB4, 0xD9};		// std network
-unsigned char pMessageStartTst[4]={0xFA, 0xBF, 0xB5, 0xDA};		// testnet
-std::string BTCMsgCommandsString="01 version 02 verack 03 addr 04 inv 05 getdata 06 getblocks 07 getheaders 08 tx 09 block 10 getaddr 11 checkorder 12 submitorder 13 reply 14 ping 15 alert ";
+const unsigned char pMessageStartStd[4]={0xF9, 0xBE, 0xB4, 0xD9};		// std network
+const unsigned char pMessageStartTst[4]={0xFA, 0xBF, 0xB5, 0xDA};		// testnet
+const std::string BTCMsgCommandsString="01 version 02 verack 03 addr 04 inv 05 getdata 06 getblocks 07 getheaders 08 tx 09 block 10 getaddr 11 checkorder 12 submitorder 13 reply 14 ping 15 alert ";
 
-unsigned int iProtocolVersion=60000;  // protocol version 0.6.00
-std::string BTCMsgUserAgent="BiRD:0.1(Windows32)/MySQL:5.5";
+const unsigned int iProtocolVersion=60001;  // protocol version 0.6.001 = first 0.6 version including BIP0031
+const std::string BTCMsgUserAgent="BiRD:0.2(Windows64)/MySQL:5.6";
 
+DWORD dwSleepProcessBlock=0;				// Sleep time between processing of block message to throttle size of MultiPrune
 
 __int64 GetUnixTimeStamp()
 {
-//	System::TimeSpan ts = (dt - System::DateTime(1970,1,1,0,0,0,0));
-//	return ts.TotalSeconds;
 	return time(NULL);
 }
 
@@ -67,7 +68,9 @@ void BTCMessage::Init(bool bTestNetwork)
 	iMsgStatus=btcmsgstat_init;
 	bPayloadChk=true;
 	memset(chCommand,0,sizeof(chCommand));
-	iPayloadLenRcvd=iPayloadLen=iPayloadChk=0;
+	iPayloadLenRcvd=0;
+	iPayloadLen=0;
+	iPayloadChk=0;
 	vPayload.clear();
 }
 
@@ -90,7 +93,7 @@ BTCMessage::BTCMessage(const enum BTCMsgCommands iCommand, bool bTestNetwork)
 
 void BTCMessage::SetCommand(const char *szCommand)
 {
-	int iLen = strlen(szCommand);	// length of ascii string of command
+	size_t iLen = strlen(szCommand);	// length of ascii string of command
 	if (iLen>=sizeof(chCommand))
 		iLen=sizeof(chCommand);		// can't be too long !
 	else
@@ -185,7 +188,7 @@ uint64 BTCMessage::GetVarInt(std::vector<unsigned char>::iterator &it)
 		it++;
 		return (uint64)c;
 	}
-	uint64 x;
+	uint64 x=0;
 	switch (c) {
 	case 0xfd:	// 2 byte int
 		x = (uint64)*((unsigned short *)&it[1]);
@@ -221,6 +224,27 @@ bool BTCMessage::VerifyChecksum(void)
 	return (memcmp(&h, &iPayloadChk, sizeof(iPayloadChk))==0);
 }
 
+int BTCMessage::GetBlockHeight(void)
+{
+	if (iCommand==btcmsg_block && (*((int *)&vPayload[0])) >= 2) {		// 'block' msg with version at least 2
+		std::vector<unsigned char>::iterator it = vPayload.begin()+80;	// start of transaction area in block
+		if (GetVarInt(it)>0) {				// number of tx should be bigger then 0
+			it+=4;							// skip version first tx
+			if (GetVarInt(it)>0) {			// should have at least one txin
+				it+=36;						// skip outpoint in first txin
+				if (GetVarInt(it)>=4) {		// script length should be at least 4 bytes long
+					if (it[0]!=3)
+						return -2;
+					else {
+						int uiHeight = (int)it[1] + (((int)it[2])<<8) + (((int)it[3])<<16);
+						return uiHeight;
+					}
+				}
+			}
+		}
+	}
+	return -2;					// block does not contain BIP0034 information
+}
 
 BTCtcp::BTCtcp(void)			// constructor of our class
 {
@@ -380,9 +404,9 @@ void BTCtcp::WriteToSocket(void)
 		return;
 	}
 	if (bWriteReady) {	// still ok to send something
-		int iLen = outBuffer.size() - outPos;								// how much data to send
-		if (iLen>0) {
-			int iSent = send(skBTC, &outBuffer[outPos], iLen,0);			// try to send it
+		size_t iLen = outBuffer.size() - outPos;								// how much data to send
+		if (iLen>0 && iLen<=MAXINT) {
+			int iSent = send(skBTC, &outBuffer[outPos], (int)iLen,0);			// try to send it
 			if (iSent == SOCKET_ERROR) {				// could not send anything
 				iBTCError = WSAGetLastError();
 				if (iBTCError == WSAEWOULDBLOCK) 		// send would block, so wait for notify message to try again
@@ -522,7 +546,11 @@ bool BTCtcp::WriteMessage(BTCMessage& msgOut)
 	// calculate length and checksum of payload
 	const char *p;
 	std::vector<char>* outBuf = new std::vector<char>;			// our temporary send buffer (inside of thread)
-	msgOut.iPayloadLen = msgOut.vPayload.size();
+	if (msgOut.vPayload.size() > UINT_MAX) {					// payload to big to fit in Bitcoin message !
+		BOOST_LOG_TRIVIAL(fatal) << "FATAL error: payload of message to send too big";
+		return false;
+	}
+	msgOut.iPayloadLen = (unsigned int)msgOut.vPayload.size();
 	if (msgOut.bPayloadChk) {	// msg needs to send checksum
 		uint256 hash = Hash(msgOut.vPayload.begin(),msgOut.vPayload.end());
 		memcpy(&msgOut.iPayloadChk, &hash, sizeof(msgOut.iPayloadChk));			// only first bytes needed
@@ -575,14 +603,17 @@ LRESULT BTCtcp::ProcessNodeStatus(HWND hWnd, LPARAM lParam)
 	case 2:  // "verack" message received --> now send a getblocks
 		// determine hash_start:
 		{
-			mysqlpp::Connection *my_conn = mydb.GrabConnection();
-			int iSafeHeight = mydb.GetSafeHeight(my_conn);			// minimal height to ask
+			BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+			if (my_conn==NULL)
+				break;
+			BIRDDB_Query q = my_conn->query();
+			int iSafeHeight = mydb.GetSafeHeight(q);			// minimal height to ask
 			if (iSafeHeight<0)
 				iSafeHeight=0;
-			int iBestHeight = mydb.GetBestHeightKnown(my_conn)-10;	// optimal height to ask (10 blocks deep from current known end)
+			int iBestHeight = mydb.GetBestHeight(q)-(mydb.GetBlockDepth()>>1);			// optimal height to ask is half of confirming block depth from best end
 			if (iBestHeight<iSafeHeight)
-				iBestHeight=iSafeHeight;							// if we did not yet download 10 blocks
-			if (!mydb.GetBlockHashFromHeight(my_conn, iBestHeight, hash_start)) {
+				iBestHeight=iSafeHeight;							// if we did not yet download enough blocks
+			if (!mydb.GetBlockHashFromHeight(q, iBestHeight, hash_start)) {
 				iBestHeight=0;
 			}
 			if (SendMsg_GetBlocks(hash_start, uint256(0))) {
@@ -620,32 +651,45 @@ LRESULT BTCtcp::ProcessNodeStatus(HWND hWnd, LPARAM lParam)
 //
 // Process "inv", "block" and "tx" messages from the concurrent queue
 //
-bool ProcessInvMsg(BTCMessage& msg, bool bProcessTx)
+bool ProcessInvMsg(BTCMessage *msg, bool bProcessTx)
 {
-	if (!msg.VerifyChecksum())	// something wrong with checksum, can't process it
+	BOOST_LOG_TRIVIAL(info) << "Processing 'inv' message";
+	if (!msg->VerifyChecksum()) {	// something wrong with checksum, can't process it
+		BOOST_LOG_TRIVIAL(warning) << "Checksum of 'inv' message invalid";
 		return false;
+	}
 	// we received a list of blocks from safe height and above
 	// step through list and each block not in ChainBlocks table should be asked for in a getdata msg
-	std::vector<unsigned char>::iterator it = msg.vPayload.begin();
-	unsigned int iNrInvRcvd = (unsigned int)msg.GetVarInt(it);
-	if (msg.vPayload.size()<(iNrInvRcvd*36+(it - msg.vPayload.begin())))
+	std::vector<unsigned char>::iterator it = msg->vPayload.begin();
+	uint64 iNrInvRcvd = msg->GetVarInt(it);
+	if (msg->vPayload.size()<(iNrInvRcvd*36+(it - msg->vPayload.begin()))) {
+		BOOST_LOG_TRIVIAL(warning) << "Invalid length of payload in 'inv' message";
 		return false;					// something wrong with length of msg
+	}
 	unsigned int i, invType;
 	uint256 invHash;
 	std::vector<uint256> vUnknownBlockHashes;				// save all block hashes we don't know yet
 	std::vector<uint256> vUnknownTxHashes;					// save all tx hashes we don't know yet
-	mysqlpp::Connection *my_conn = mydb.GrabConnection();	// get a database connection
+	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();	// get a database connection
+	if (my_conn==NULL) {
+		BOOST_LOG_TRIVIAL(warning) << "Unable to grab db connection, terminating processing of 'inv' message";
+		return false;
+	}
+	BIRDDB_Query q = my_conn->query();
 	for (i=0 ; i<iNrInvRcvd; i++) {	// loop through all vectors received
 		memcpy(&invType, &it[i*36], 4);
 		memcpy(invHash.begin(), &it[i*36+4], 32);	// get the hash
 		switch(invType)
 		{
 		case MSG_TX:  // it is a transaction
-			if (bProcessTx && !mydb.IsTxHashKnown(my_conn, &invHash))
+			if (bProcessTx && !mydb.IsTxHashKnown(q, &invHash)) {
+				BOOST_LOG_TRIVIAL(trace) << " * Unknown 'tx' " << invHash.ToString();
 				vUnknownTxHashes.push_back(invHash);
+			}
 			break;
 		case MSG_BLOCK: // it is a block
-			if (!mydb.IsBlockHashKnown(my_conn, &invHash)) 		// if hash is not yet known, add it to our list of unknown hashes
+			if (!mydb.IsBlockHashKnown(q, &invHash)) 		// if hash is not yet known, add it to our list of unknown hashes
+				BOOST_LOG_TRIVIAL(trace) << " * Unknown 'block' " << invHash.ToString();
 				vUnknownBlockHashes.push_back(invHash);
 			break;
 		}
@@ -656,64 +700,100 @@ bool ProcessInvMsg(BTCMessage& msg, bool bProcessTx)
 	return BTCnode.SendMsg_GetData(vUnknownTxHashes, MSG_TX) && BTCnode.SendMsg_GetData(vUnknownBlockHashes, MSG_BLOCK);
 }
 
-bool ProcessBlockMsg(BTCMessage &msg)
+bool ProcessBlockMsg(BTCMessage *msg)
 {
-	if (!msg.VerifyChecksum() || msg.vPayload.size()<=80)	// something wrong with checksum or length, can't process it
+	if (!msg->VerifyChecksum() || msg->vPayload.size()<=80) {	// something wrong with checksum or length, can't process it
+		BOOST_LOG_TRIVIAL(error) << "Block msg checksum invalid or payload < 80 bytes";
 		return false;
+	}
 
 	// calculate hash of this block
-	uint256 curBlockHash = Hash(msg.vPayload.begin(), msg.vPayload.begin()+80);
+	uint256 curBlockHash = Hash(msg->vPayload.begin(), msg->vPayload.begin()+80);
 
-	mysqlpp::Connection *my_conn = mydb.GrabConnection();	// get a database connection
-	if (mydb.IsBlockHashKnown(my_conn, &curBlockHash)) {
+	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();	// get a database connection
+	if (my_conn==NULL)
+		return false;
+	BIRDDB_Query q = my_conn->query();
+	if (mydb.IsBlockHashKnown(q, &curBlockHash)) {
 		mydb.ReleaseConnection(my_conn);
 		return true;			// nothing to do, as we got already this block somehow (from previous download or unsollicited message)
 	}
 	// now do the real stuff: block is not known yet
 	ChainBlocks newBlock(0);	// create new block to add, we don't know ID yet
 	newBlock.hash.assign((char *)curBlockHash.begin(), 32);
-	newBlock.prevhash.assign((char *)&msg.vPayload[4], 32);	// first 4 bytes are version number, not checked for now
+	newBlock.prevhash.assign((char *)&(msg->vPayload[4]), 32);	// first 4 bytes are version number, not checked for now
 	newBlock.height=-2;			// height not yet known
 
+	// BIP0034: height in coinbase if block version is 2
+	int iV2Height= msg->GetBlockHeight();
+
 	// --> see if prevBlockHash exists in existing blocks in ChainBlocks
-	int iPrevHeight = mydb.GetBlockHeightFromHash(my_conn, newBlock.prevhash);
-	if (iPrevHeight>=-1) {					// this new block has a previous hash of a temporary block with known height
+	int iPrevHeight = mydb.GetBlockHeightFromHash(q, newBlock.prevhash);
+	BOOST_LOG_TRIVIAL(trace) << "Processing block V2height=" << iV2Height << ", PrevHeight=" << iPrevHeight;
+	if (iV2Height<0)
+		iV2Height=iPrevHeight+1;			// set V2Height equal to height calculated from block hash if V2Height is unknown (no BIP0034 info)
+
+	int iBestHeight=mydb.GetBestHeight(q);
+	if (iPrevHeight>=-1) {					// this new block chains with a previous block with known height
 		newBlock.height=iPrevHeight+1;		// so height of this block is known
-		int iBestHeight=mydb.GetBestHeightKnown(my_conn);
-		if (newBlock.height<=iBestHeight) {	// height of new block is less or equal then best known temporary --> discard all temp blocks with this height and above
-			for (iPrevHeight=iBestHeight; iPrevHeight>=newBlock.height; iPrevHeight--)
-				mydb.DeleteBlockDataOfHeight(my_conn, iPrevHeight);
+		int iSafeHeight=mydb.GetSafeHeight(q);
+		if (newBlock.height<iSafeHeight) {
+			BOOST_LOG_TRIVIAL(fatal) << "New block with height " << newBlock.height << " received while safe height is already " << iSafeHeight;
+			BOOST_LOG_TRIVIAL(fatal) << "Discarding this block, watch out for DOS attack !";
+			mydb.ReleaseConnection(my_conn);
+			return false;
+		}
+		if (newBlock.height<=iBestHeight || iV2Height!=(iPrevHeight+1)) {	// height of new block is less or equal then best known temporary OR BIP0034 info in block is different --> discard all temp blocks with this height and above
+			BOOST_LOG_TRIVIAL(error) << "New block " << newBlock.height << " received which is less then best height known (" << iBestHeight << ") OR BIP0034 height (" << iV2Height << ") different";
+			if (newBlock.height<=iBestHeight) {
+				BOOST_LOG_TRIVIAL(warning) << "Deleting blocks " << newBlock.height << " to " << iBestHeight;
+				for (iPrevHeight=iBestHeight; iPrevHeight>=newBlock.height; iPrevHeight--)
+					mydb.DeleteBlockDataOfHeight(q, iPrevHeight);
+				mydb.SetBestHeight(q, newBlock.height-1);					// update height of best block chain
+			}
 		}
 	}
-	else {									// this new block has unknown height
-		if (BTCnode.GetNodeStatus()>4) {				// we have an up-to-date block chain, so this is unusual, probably a block fork happened
-			int iSafeHeight = mydb.GetSafeHeight(my_conn);
-			if (iSafeHeight>0) {
-				uint256 hash_start;
-				if (mydb.GetBlockHashFromHeight(my_conn, iSafeHeight, hash_start)) {
-					if (BTCnode.SendMsg_GetBlocks(hash_start, uint256(0))) {
-						BTCnode.Peer_AskedBlockHeight = iSafeHeight + 500;  // we asked up to 500 new blocks
-					}
+	else {									// previous block has unknown height
+		if (iV2Height>0)
+			newBlock.height=iV2Height;		// but we can get height from BIP0034 info
+	}
+
+	if (newBlock.height>(iBestHeight+10000)) {						// new received block is way ahead of our current best chain
+		mydb.ReleaseConnection(my_conn);
+		return true;												// discard the block for now to avoid needless growth of chain* tables
+	}
+
+	if ( (iPrevHeight<-1 && BTCnode.GetNodeStatus()>4) || ( iPrevHeight>=-1 && iV2Height!=(iPrevHeight+1) )  ) {			// new block has unknown height with up-to-date chain OR BIP0034 info is different
+		// this is unusual, probably a block fork happened  --> get all block again from safe height
+		BOOST_LOG_TRIVIAL(error) << "New block received with unknown or false height with up-to-date chain";
+		int iSafeHeight = mydb.GetSafeHeight(q);
+		if (iSafeHeight>0) {
+			uint256 hash_start;
+			if (mydb.GetBlockHashFromHeight(q, iSafeHeight, hash_start)) {
+				if (BTCnode.SendMsg_GetBlocks(hash_start, uint256(0))) {
+					BOOST_LOG_TRIVIAL(info) << "Asking blocks from safe height " << iSafeHeight << " again due to possible block fork";
+					BTCnode.Peer_AskedBlockHeight = iSafeHeight + 500;  // we asked up to 500 new blocks
 				}
 			}
 		}
 	}
 	newBlock.status = (newBlock.height>=0)? 1 : 0;
 
-	// --> add it to ChainBlocks
-	if (mydb.AddBlockToChain(my_conn, newBlock)) {	// block added successfully
+	// --> add it to ChainBlocks with prevention of deadlocks & inside a whole transaction
+	boost::lock_guard<boost::mutex> lock(mydb.dbmutex);
+	mysqlpp::Transaction myTrans(*my_conn);
+	if (mydb.AddBlockToChain(q, newBlock)) {	// block added successfully
 		// --> add tx's to ChainTxIns and ChainTxOuts
 		std::vector<unsigned char>::iterator itTxBegin;
-		std::vector<unsigned char>::iterator it=msg.vPayload.begin()+80;	// we start at 80 offset with TX data
-		int iNrTransactions = (int)msg.GetVarInt(it);						// retrieve the varint indicating number of transactions
+		std::vector<unsigned char>::iterator it=msg->vPayload.begin()+80;	// we start at 80 offset with TX data
+		int iNrTransactions = (int)msg->GetVarInt(it);						// retrieve the varint indicating number of transactions
 		int iEachTx;
-		mysqlpp::Transaction myTrans(*my_conn);
 		for (iEachTx=0; iEachTx < iNrTransactions; iEachTx++) {		// loop through each transaction
 			itTxBegin = it;											// remember where current transaction starts for hash calculation later on
 			ChainTxs newTx(newBlock.ID, iEachTx);					// insert incomplete Tx as we need referencial integrity on depending TxIns and TxOuts
-			if (mydb.InsertChainTx(my_conn, newTx)) {
+			if (mydb.InsertChainTx(q, newTx)) {
 				it +=4;		// skip version number
-				int iNrTxIO = (int)msg.GetVarInt(it);				// number of input transactions
+				int iNrTxIO = (int)msg->GetVarInt(it);				// number of input transactions
 				int iEachTxIO;
 				for (iEachTxIO=0; iEachTxIO < iNrTxIO; iEachTxIO++) {
 					// loop through each "in" transaction
@@ -722,12 +802,17 @@ bool ProcessBlockMsg(BTCMessage &msg)
 					newTxIn.opHash.assign((char *)&it[0],32);	// OutPoint hash
 					memcpy(&newTxIn.opN, &it[32], 4);			// OutPoint index number
 					it+=36;		// skip OutPoint
-					int iVI = (int)msg.GetVarInt(it);			// length of script
+					int iVI = (int)msg->GetVarInt(it);			// length of script
 					it+=iVI;	// skip script
 					it+=4;		// skip sequence
-					mydb.InsertChainTxIn(my_conn, newTxIn);
+					if (newTxIn.opN>=0) {							// negative opN is for coinbase or illegal input; don't need to store it
+						if (!mydb.InsertChainTxIn(q, newTxIn)) {
+							myTrans.rollback();						// abort transaction because we couldn't insert the txin
+							return false;
+						}
+					}
 				}
-				iNrTxIO = (int)msg.GetVarInt(it);				// number of output transactions
+				iNrTxIO = (int)msg->GetVarInt(it);				// number of output transactions
 				for (iEachTxIO=0; iEachTxIO < iNrTxIO; iEachTxIO++) {
 					// loop through each "out" transaction
 					// we examine the script and extract: value, type and hash(es)
@@ -735,7 +820,7 @@ bool ProcessBlockMsg(BTCMessage &msg)
 					memcpy(&newTxOut.value, &it[0], 8);			// value of output
 					it+=8;		// skip the value
 					newTxOut.txType=0;
-					int iVI = (int)msg.GetVarInt(it);			// length of script
+					int iVI = (int)msg->GetVarInt(it);			// length of script
 					// examine script to find out the type of transactions
 					if (it[0]<OP_PUSHDATA1) {	// script starts with immediate data
 						if (it[0]==65 && it[66]==OP_CHECKSIG) {		// transaction is "Transaction to IP address/ Generation"
@@ -763,41 +848,53 @@ bool ProcessBlockMsg(BTCMessage &msg)
 						}
 					}
 					it+=iVI;	// skip script
-					if (newTxOut.txType!=0)
-						mydb.InsertChainTxOut(my_conn, newTxOut);
+					if (newTxOut.txType!=0) {
+						if (!mydb.InsertChainTxOut(q, newTxOut)) {
+							myTrans.rollback();						// abort transaction because we couldn't insert the txout
+							return false;
+						}
+					}
 				} // END for each TxOut
 				it+=4;		// skip lock time
 			} // END if insert chain ok
 			// iterator it points now to the end of the transaction, now we can calculate the hash of it
 			curBlockHash = Hash(itTxBegin, it);						// calculate it
 			newTx.txHash.assign((const char *)&curBlockHash, 32);	// transfer to record
-			mydb.UpdateChainTx(my_conn, newTx);						// update the already inserted record
-			mydb.TxUnconfirmedDies(my_conn, newTx.txHash);			// set life=0 for this unconfirmed tx
+			mydb.UpdateChainTx(q, newTx);						// update the already inserted record
+			mydb.TxUnconfirmedDies(q, newTx.txHash);			// set life=0 for this unconfirmed tx
 		} // END loop Tx
 		myTrans.commit();
-	} // END add block
-	mydb.TxUnconfirmedAges(my_conn);
+		mydb.PruneInsideBlock(q, newBlock.ID);
+	}	// END add block successful
+	else {
+		myTrans.rollback();
+		BOOST_LOG_TRIVIAL(error) << "Unable to add block " << newBlock.equal_list() << " to ChainBlocks, rolling back";
+	}	// END add block unsuccessful
+	mydb.TxUnconfirmedAges(q);
 	mydb.ReleaseConnection(my_conn);
 	return true;
 }
 
-bool ProcessTxMsg(BTCMessage &msg)
+bool ProcessTxMsg(BTCMessage *msg)
 {
-	if (!msg.VerifyChecksum() || msg.vPayload.size()<=55)				// something wrong with checksum or length, can't process it
+	if (!msg->VerifyChecksum() || msg->vPayload.size()<=55)				// something wrong with checksum or length, can't process it
 		return false;
-	uint256 curHash = Hash(msg.vPayload.begin(), msg.vPayload.end());	// compute tx hash
-	mysqlpp::Connection* my_conn = mydb.GrabConnection();
-	if (mydb.IsTxHashKnown(my_conn, &curHash)) {
+	uint256 curHash = Hash(msg->vPayload.begin(), msg->vPayload.end());	// compute tx hash
+	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+	if (my_conn==NULL)
+		return false;
+	BIRDDB_Query q = my_conn->query();
+	if (mydb.IsTxHashKnown(q, &curHash)) {
 		mydb.ReleaseConnection(my_conn);
 		return true;				// nothing to do, hash already known
 	}
 	TxUnconfirmed newTx(0);							// ID will AUTO_INCREMENT
 	newTx.hash.assign((const char *)&curHash, 32);	// hash of tx
 	newTx.life=100;									// maximum life of tx is 100 blocks
-	if (mydb.InsertTxUnconfirmed(my_conn, newTx)) {			// insert Tx into TxUnconfirmed table
+	if (mydb.InsertTxUnconfirmed(q, newTx)) {		// insert Tx into TxUnconfirmed table
 		// inputs of this transaction = outputs that are no longer available --> we need to store these so clients can deny a double spend attempt
-		std::vector<unsigned char>::iterator it=msg.vPayload.begin()+4;  // skip version for the moment
-		int iNrTxIO = (int)msg.GetVarInt(it);				// number of input transactions
+		std::vector<unsigned char>::iterator it=msg->vPayload.begin()+4;  // skip version for the moment
+		int iNrTxIO = (int)msg->GetVarInt(it);				// number of input transactions
 		int iEachTxIO;
 		for (iEachTxIO=0; iEachTxIO < iNrTxIO; iEachTxIO++) {
 			// loop through each "in" transaction
@@ -806,14 +903,14 @@ bool ProcessTxMsg(BTCMessage &msg)
 			newTxIn.hash.assign((char *)&it[0],32);			// OutPoint hash
 			memcpy(&newTxIn.txindex, &it[32], 4);			// OutPoint index number
 			it+=36;		// skip OutPoint
-			int iVI = (int)msg.GetVarInt(it);			// length of script
+			int iVI = (int)msg->GetVarInt(it);			// length of script
 			it+=iVI;	// skip script
 			it+=4;		// skip sequence
-			mydb.InsertTxInUnconfirmed(my_conn, newTxIn);
+			mydb.InsertTxInUnconfirmed(q, newTxIn);
 		}
 	}
 	TCHAR szStaticText[10];
-	int i=mydb.NrTxUnconfirmed(my_conn);
+	int i=mydb.NrTxUnconfirmed(q);
 	_itow_s(i, szStaticText, 10, 10);
 	SetWindowText(hStaticUnconfirmedTxs,szStaticText);
 	mydb.ReleaseConnection(my_conn);
@@ -828,18 +925,20 @@ LRESULT BTCtcp::ProcessReadMessage(HWND hWnd, LPARAM lParam)
 	switch (msgIn.iCommand) {
 	case btcmsg_version:
 		{		// received a version msg  --> send verack message back
-			unsigned int iRcvdVer;
 			std::vector<unsigned char>::iterator it=msgIn.vPayload.begin();
-			memcpy(&iRcvdVer, &it[0], sizeof(int));	// get version
-			if (iRcvdVer>=209) {	// node has sent best height information
+			memcpy(&Peer_ProtoVersion, &it[0], sizeof(int));	// extract protocol version of peer
+			if (Peer_ProtoVersion>=209) {	// node has sent best height information
 				it +=80;			// skip fixed length message data		
 				uint64 uil=msgIn.GetVarInt(it);  // now a varlength string, uil=its length
-				it +=uil;
+				it +=(__w64 int)uil;
 				memcpy(&Peer_BlockHeight,&it[0],sizeof(int));
 			}
 			else {
-				mysqlpp::Connection * c = mydb.GrabConnection();
-				Peer_BlockHeight = mydb.GetBestHeightKnown(c);
+				BIRDDB_ConnectionPtr c = mydb.GrabConnection();
+				if (c==NULL) 
+					break;
+				BIRDDB_Query q = c->query();
+				Peer_BlockHeight = mydb.GetBestHeight(q);
 				mydb.ReleaseConnection(c);
 			}
 			bFlag = SendMsg_Verack();
@@ -855,7 +954,7 @@ LRESULT BTCtcp::ProcessReadMessage(HWND hWnd, LPARAM lParam)
 	case btcmsg_inv:											// received a inv msg --> check if it was asked for, or unsollicited
 		if (iBTCNodeStatus>=3) {
 			BTCMessage *btcmsgcopy = new BTCMessage(msgIn);		// copy the message
-			cqInvMsg.push(*btcmsgcopy);							// push it on queue for worker thread
+			cqInvMsg.push(btcmsgcopy);							// push it on queue for worker thread
 		}
 		if (iBTCNodeStatus==3) {								// we asked for blocks, here is our response probably
 			iBTCNodeStatus++;									// go to next lvl :)
@@ -867,7 +966,7 @@ LRESULT BTCtcp::ProcessReadMessage(HWND hWnd, LPARAM lParam)
 	case btcmsg_block:											// receiving block data
 		if (iBTCNodeStatus>3) {									// we accept "block" messages
 			BTCMessage *btcmsgcopy = new BTCMessage(msgIn);		// copy the message
-			cqBlockMsg.push(*btcmsgcopy);						// push it on queue for worker thread
+			cqBlockMsg.push(btcmsgcopy);						// push it on queue for worker thread
 		}
 		bFlag=true;
 		break;
@@ -875,7 +974,7 @@ LRESULT BTCtcp::ProcessReadMessage(HWND hWnd, LPARAM lParam)
 	case btcmsg_tx:		// receiving a transaction
 		if (iBTCNodeStatus>4) {		// we accept tx messages
 			BTCMessage *btcmsgcopy = new BTCMessage(msgIn);		// copy the message
-			cqTxMsg.push(*btcmsgcopy);							// push it on stack for worker thread
+			cqTxMsg.push(btcmsgcopy);							// push it on stack for worker thread
 		}
 		bFlag=true;
 		break;
@@ -927,14 +1026,14 @@ bool BTCtcp::SendMsg_Version(void)
 	p = (char *)&nonce;
 	msgVersion.vPayload.insert(msgVersion.vPayload.end(),p,p+sizeof(nonce));
 	//User Agent (BIP0014)
-	msgVersion.vPayload.push_back(BTCMsgUserAgent.length());		// length should be limited so that it fits 1 byte varint !
+	msgVersion.AppendVarInt(BTCMsgUserAgent.length());
 	msgVersion.vPayload.insert(msgVersion.vPayload.end(),BTCMsgUserAgent.data(),BTCMsgUserAgent.data()+BTCMsgUserAgent.length());
-/*	Old UserAgent = null string:
-    msgVersion.vPayload.push_back(0);
-*/
 	//highest block known
-	mysqlpp::Connection *my_conn = mydb.GrabConnection();
-	int i = mydb.GetBestHeightKnown(my_conn);
+	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+	if (my_conn==NULL)
+		return false;
+	BIRDDB_Query q = my_conn->query();
+	int i = mydb.GetBestHeight(q);
 	p = (char *)&i;
 	msgVersion.vPayload.insert(msgVersion.vPayload.end(),p,p+sizeof(int));
 	mydb.ReleaseConnection(my_conn);
@@ -967,6 +1066,8 @@ bool BTCtcp::SendMsg_GetBlocks(uint256 hash_start, uint256 hash_end)
 
 bool BTCtcp::SendMsg_GetData(std::vector<uint256> &vHashes, int HashType)
 {
+	if (vHashes.size()==0)		// no data to get
+		return true;		
 	BTCMessage msgGetData(btcmsg_getdata, BTC_TestNetwork);
 	// payload= count + inv vectors
 	msgGetData.AppendVarInt(vHashes.size());
@@ -975,13 +1076,18 @@ bool BTCtcp::SendMsg_GetData(std::vector<uint256> &vHashes, int HashType)
 	{
 		msgGetData.AppendInvVector(HashType, ui);
 	}
+	BOOST_LOG_TRIVIAL(info) << "Sending 'getdata' for " << vHashes.size() << ( (HashType==MSG_TX)? " tx(s)":" block(s)");
 	return WriteMessage(msgGetData);
 }
 
 bool BTCtcp::SendMsg_Ping(void)
 {
 	BTCMessage msgVerack(btcmsg_ping, BTC_TestNetwork);		// construct message with "ping" command
-	// no payload
+	if (Peer_ProtoVersion>60000) {							// BIP0031 in effect -> add nonce to ping message
+		msgVerack.vPayload.assign(8, '\0');					// nonce is all zero, as we do not use nonce for the moment
+	}
+	GetSystemTime(&stPing);
+	BOOST_LOG_TRIVIAL(info) << "Sending 'ping' message";
 	return WriteMessage(msgVerack);
 }
 
@@ -1008,21 +1114,29 @@ DWORD WINAPI Thread_DoProcessInvMsg(LPVOID lParam)
 {
 	mysqlpp::Connection::thread_start();
 	while (!bThreadAbort[WT_InvMsg]) {		// loop until thread abort signal comes
-		BTCMessage msg;
+		BTCMessage *msg = nullptr;
 		if (cqInvMsg.try_pop(msg)) {		// successfully popped an "inv" message from the queue
-			bool bCheckTx=false;
+/*			bool bCheckTx=false;
 			if (BTCnode.GetNodeStatus()>4) {    // chain is up to date
-				mysqlpp::Connection * mc = mydb.GrabConnection();
-				int iBest = mydb.GetBestHeightKnown(mc);
-				int iSafe = mydb.GetSafeHeight(mc);
+				BIRDDB_ConnectionPtr mc = mydb.GrabConnection();
+				BIRDDB_Query q = mc->query();
+				int iBest = mydb.GetBestHeightKnown(q);
+				int iSafe = mydb.GetSafeHeight(q);
 				mydb.ReleaseConnection(mc);
 				if (iBest>0 && iSafe>0)
 					bCheckTx = (iBest <= iSafe+20);    // and less then 20 blocks unconfirmed
+
 			}
-			ProcessInvMsg(msg, BTCnode.GetNodeStatus()>4);
+*/
+			if (!ProcessInvMsg(msg, BTCnode.GetNodeStatus()>4)) {
+				BOOST_LOG_TRIVIAL(warning) << "An 'inv' message was not processed normally";
+			}
+			delete msg;
 		}
-		else
+		else {
+			BOOST_LOG_TRIVIAL(trace) << "Thread for 'inv' messages goes to sleep";
 			Sleep(499);						// nothing to do, wait 0.5 seconds before checking again
+		}
 	}
 	PostMessage(hWndMain, myMsg_ThreadFinished, 0, WT_InvMsg);
 	mysqlpp::Connection::thread_end();
@@ -1032,28 +1146,33 @@ DWORD WINAPI Thread_DoProcessInvMsg(LPVOID lParam)
 DWORD WINAPI Thread_DoProcessBlockMsg(LPVOID lParam)
 {
 	mysqlpp::Connection::thread_start();
-	OutputDebugString(L"DoProcessBlockMsg thread started\n");
+	BOOST_LOG_TRIVIAL(trace) << "DoProcessBlockMsg thread started";
 	while (!bThreadAbort[WT_BlockMsg]) {	// loop until thread abort signal comes
-		BTCMessage msg;
-		OutputDebugString(L"DoProcessBlockMsg try pop\n");
+		BTCMessage *msg=nullptr;
 		if (cqBlockMsg.try_pop(msg)) {		// successfully popped an "block" message from the queue
-			OutputDebugString(L"DoProcessBlockMsg processBlockMsg\n");
+			BOOST_LOG_TRIVIAL(trace) << "DoProcessBlockMsg processBlockMsg";
 			if (ProcessBlockMsg(msg)) {		// sucessfully processed the block
-				OutputDebugString(L"BlockMsg finished\n");
-				PostMessage(hWndMain, myMsg_BlockProcessed, 0, 0);	// inform main thread 
+				BOOST_LOG_TRIVIAL(trace) << "BlockMsg process finished";
+				delete msg;
+				PostMessage(hWndMain, myMsg_BlockProcessed, 0, 0);	// inform main thread
+				Sleep(dwSleepProcessBlock);							// throttle processing of new blocks
+			}
+			else
+			{
+				cqBlockMsg.push(msg);		// couldn't process, put it back in queue !
 			}
 		}
 		else {		// not possible to retrieve a msg from the queue (probably empty)
-			OutputDebugString(L"DoProcessBlockMsg sleeping\n");
+			BOOST_LOG_TRIVIAL(trace) << "DoProcessBlockMsg sleeping";
 			DWORD dwSleep;
 			if (BTCnode.GetNodeStatus()>4) {
-				dwSleep=521;		// up-to-date chain will only receive 1 block each 10 minutes
+				dwSleep=1024;		// up-to-date chain will only receive 1 block each 10 minutes
 			}
 			else {
 				if (BTCnode.GetNodeStatus()>2)
-					dwSleep=149;	// downloading chain now, should get blocks frequently
+					dwSleep=100;	// downloading chain now, should get blocks frequently
 				else
-					dwSleep=8000;  // setting up node, don't need frequent check for the moment
+					dwSleep=2000;  // setting up node, don't need frequent check for the moment
 			}
 			Sleep(dwSleep);			// queue got empty, wait before checking again
 		}
@@ -1066,11 +1185,12 @@ DWORD WINAPI Thread_DoProcessBlockMsg(LPVOID lParam)
 DWORD WINAPI Thread_DoProcessTxMsg(LPVOID lParam)
 {
 	mysqlpp::Connection::thread_start();
-	OutputDebugString(L"DoProcessTxMsg thread started\n");
+	BOOST_LOG_TRIVIAL(trace) << "DoProcessTxMsg thread started";
 	while (!bThreadAbort[WT_TxMsg]) {
-		BTCMessage msg;
+		BTCMessage *msg=nullptr;
 		if (cqTxMsg.try_pop(msg)) {			// successfully popped an "tx" message from the queue
 			ProcessTxMsg(msg);				// process it
+			delete msg;
 		}
 		else		// not possible to retrieve a msg from the queue (probably empty)
 			Sleep(541);
@@ -1083,30 +1203,83 @@ DWORD WINAPI Thread_DoProcessTxMsg(LPVOID lParam)
 DWORD WINAPI Thread_DoBlockConfirms(LPVOID lParam)
 {
 	mysqlpp::Connection::thread_start();
+	BOOST_LOG_TRIVIAL(trace) << "Thread DoBlockConfirms started";
+	BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();
+	BIRDDB_Query q = my_conn->query();
+	mydb.SetBlockConfirmationEnd(mydb.GetSafeHeight(q));	// initialize up to where blocks are certainly confirmed
+	mydb.ReleaseConnection(my_conn);
 	while(!bThreadAbort[WT_DBConfirm]) {
-		mysqlpp::Connection * my_conn = mydb.GrabConnection();	// grab a database connection
-		int iBestHeight;
+		int iBestHeight=0;
+		int iSafeHeight=0;
+		DWORD dwSleep=0;
+		my_conn = mydb.GrabConnection();
 		if (my_conn!=NULL) {
-			mydb.ConfirmTempBlocks(my_conn);				    // process blocks more then 10 blocks deep.
-			TCHAR szStaticText[10];
-			iBestHeight = mydb.GetSafeHeight(my_conn);
+			q = my_conn->query();
+			iBestHeight = mydb.GetBestHeight(q);
+			iSafeHeight = mydb.GetSafeHeight(q);
+			switch (BTCnode.GetNodeStatus()) {
+			case 0:
+			case 1:
+			case 2:
+			case 3:   // NodeStatus < 4 means node is not yet 'active'
+				if (iSafeHeight < (iBestHeight - 2* mydb.GetBlockDepth()))    // lots of confirmations to do
+					mydb.OptimizeForDownload(q);
+				break;
+			case 4:	  // node has become active and is catching up
+				if ( (iBestHeight < (BTCnode.Peer_BlockHeight - 2* mydb.GetBlockDepth())) || (iSafeHeight < (BTCnode.Peer_BlockHeight - 2* mydb.GetBlockDepth()))) {
+					mydb.OptimizeForDownload(q);
+				}
+				if (iBestHeight>iSafeHeight) {
+				  dwSleep = ((BTCnode.Peer_BlockHeight-iBestHeight)/(iBestHeight-iSafeHeight))>>1;	// balance priority between download and confirming temp blocks
+				  if (dwSleep>3000)
+					  dwSleep=3000;   // maximum 3 seconds between confirms
+				}
+				else
+				  dwSleep=1000;
+				break;
+			default:  // node is up to date on blocks, status 5 and above
+				if ( iSafeHeight > (iBestHeight - 3 * mydb.GetBlockDepth() /2)) {
+					mydb.OptimizeForQuerying(q);
+					if (iSafeHeight > (iBestHeight - mydb.GetBlockDepth() - 6))
+						dwSleep = 1000;
+				}
+			}
+			iSafeHeight= mydb.ConfirmTempBlocks(my_conn, dwSleep);				    // process blocks more then 'block_depth' deep.
 			mydb.ReleaseConnection(my_conn);
-			_itow_s(iBestHeight, szStaticText, 10, 10);
+			TCHAR szStaticText[10];
+			_itow_s(iSafeHeight, szStaticText, 10, 10);
 			SetWindowText(hStaticProcessedBlock,szStaticText);   
 		}
-		DWORD dwSleep;
-		if (BTCnode.GetNodeStatus()>4 && (iBestHeight+15>BTCnode.Peer_BlockHeight)) {
-			dwSleep=4999;		// up-to-date chain will only receive 1 block each 10 minutes
-		}
-		else {
-			if (BTCnode.GetNodeStatus()>2)
-				dwSleep=13;		// downloading chain now, blocks should be waiting
-			else
-				dwSleep=10007;  // setting up node, don't need frequent check for the moment
-		}
-		Sleep(dwSleep);			// queue got empty, wait before checking again
+		Sleep(dwSleep+100);
 	}
 	PostMessage(hWndMain, myMsg_ThreadFinished, 0, WT_DBConfirm);
+	mysqlpp::Connection::thread_end();
+	return 0;
+}
+
+DWORD WINAPI Thread_DoMultiBlockPrunes(LPVOID lParam)
+{
+	mysqlpp::Connection::thread_start();
+	BOOST_LOG_TRIVIAL(trace) << "Thread DoMultiBlockPrunes started";
+	DWORD dwSleepMBP=10000;
+	while(!bThreadAbort[WT_DBMultiPrune]) {
+		Sleep(dwSleepMBP);																// wait 10 seconds before attempting another multiprune
+		BIRDDB_ConnectionPtr my_conn = mydb.GrabConnection();						// grab a database connection
+		if (my_conn!=NULL) {
+			BIRDDB_Query q = my_conn->query();
+			int iPruneHeightEnd = mydb.GetBestHeight(q) - mydb.GetBlockDepth();
+			int iPruneHeightStart = mydb.GetBlockConfirmationEnd();
+			if (iPruneHeightStart<0)
+				iPruneHeightStart=2;												// start multipruning from height 2 when confirmations have not run
+			else
+				iPruneHeightStart+= mydb.GetBlockDepth()*2;							// start multipruning at least 'block_depth' blocks further away from lastest confirmation_end
+//			mydb.PruneMultiBlock(my_conn, iPruneHeightStart, iPruneHeightEnd);		// do actual pruning
+			mydb.ReleaseConnection(my_conn);
+			mydb.PruneMultiBlockParallel(iPruneHeightStart, iPruneHeightEnd);
+			dwSleepMBP = 10000 + (iPruneHeightEnd>>4);								// calculate sleep time between multiprune attempts
+		}
+	}
+	PostMessage(hWndMain, myMsg_ThreadFinished, 0, WT_DBMultiPrune);
 	mysqlpp::Connection::thread_end();
 	return 0;
 }

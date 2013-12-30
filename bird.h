@@ -1,23 +1,41 @@
-// Copyright (c) 2011-2012 Thilo von Braun
+// Copyright (c) 2011-2013 Thilo von Braun
 // Distributed under the EUPL v1.1 software license, see the accompanying
 // file license.txt or http://www.osor.eu/eupl/european-union-public-licence-eupl-v.1.1
+//
+// Version: 0.2.0
+//   * added define for database backend selection
+//   * added logging features
+
+#pragma once
 
 #define BTC_TestNetwork false
 #define TRACE
 
 // define how to store reuseable IDs
-//	1 = use database tables (probably slow, never IDs lost)
-//	0 = use memory vectors (probably faster, info lost on interruption)
+//	1 = use database tables (slow, never IDs lost)
+//	0 = use memory vectors (fast, info lost on interruption)
 #define REUSETABLES 0									
+
+// database back-end support
+// Firebird database
+// #define BIRDDB_FIREBIRD		
+// MySQL database
+#define BIRDDB_MYSQL
+
+#ifdef BIRDDB_FIREBIRD
+#define BIRDDB IBPP
+#endif
+#ifdef BIRDDB_MYSQL
+#define BIRDDB mysqlpp
+#endif
 
 #define BTC_CommandLength 12								// commands have up to 12 chars
 #define BTC_PortNo (BTC_TestNetwork? 18333 : 8333)			// TCP port to connect to
 #define MAX_LOADSTRING 100									// max length of strings in resource file
-#define LOG_FILENAME "BiRD_Log.TXT"							// listener file to receive (debug) output
 #define MsgREPAINT (1<<5)									// always repaint
 
-#include "resource.h"    // resource file header
-// additional resources in main window
+#include "resource.h"
+
 #define IDC_BTNSQLCONNECT	9000
 #define IDC_EDITSQL			9001
 #define IDC_BTNBTCCONNECT	9005
@@ -31,16 +49,6 @@
 #define IDC_STATICDBSTAT	9016
 #define IDT_PINGTIMER		10
 
-// additional messages for Window Message Loop
-#define myTCP_Messages					WM_USER+20		// notify messages from socket
-#define myMsg_ProcessReadMessage		WM_USER+21		// process a completely read message
-#define myMsg_ProcessNodeStatus			WM_USER+22		// see if node has something to do
-#define myMsg_ProcessReadBuffer			WM_USER+23		// convert raw read buffer into (partial) message
-#define myMsg_AppendOutBuffer			WM_USER+24		// append some data to output buffer of socket
-#define myMsg_WriteToSocket				WM_USER+25		// data should be written out
-#define myMsg_ThreadFinished			WM_USER+30		// thread is done
-#define myMsg_WaitForDBDisconnect		WM_USER+31		// wait for safe database disconnect
-#define myMsg_BlockProcessed			WM_USER+32		// a block message was processed in the worker thread
 #define socketMaxReadLength 49152		// maximum characters when reading from socket
 
 // global variables needed in several cpp files
@@ -49,16 +57,31 @@ extern HWND hStaticCurBlock, hStaticMaxBlock, hStaticProcessedBlock;
 extern HWND hStaticUnconfirmedTxs;
 extern RECT rcSocketStatus, rcNodeStatus, rcChain, rcSQLStatus;
 extern HINSTANCE hInst;
-extern HANDLE hMutexDBLock;
-extern unsigned char pMessageStartStd[4];
-extern unsigned char pMessageStartTst[4];
-extern HANDLE bThreadRunning[5];
-extern bool bThreadAbort[5];
+extern const unsigned char pMessageStartStd[4];
+extern const unsigned char pMessageStartTst[4];
+extern HANDLE bThreadRunning[6];
+extern bool bThreadAbort[6];
+extern DWORD dwSleepProcessBlock;
 extern void ShowError(int iError);
 extern void ShowError(int iError, int iInformation);
 extern void ShowError(int iError, TCHAR *szInfo);
 extern void ShowError(int iError, const char *szInfo);
 extern TCHAR szINIFile[];
+
+// additional messages for Window Message Loop
+enum BirdMsgType
+{
+	myTCP_Messages = WM_USER+20,		// notify messages from socket
+	myMsg_ProcessReadMessage,			// process a completely read message
+    myMsg_ProcessNodeStatus,			// see if node has something to do
+	myMsg_ProcessReadBuffer,			// convert raw read buffer into (partial) message
+	myMsg_AppendOutBuffer,				// append some data to output buffer of socket
+	myMsg_WriteToSocket,				// data should be written out
+	myMsg_ThreadFinished,				// thread is done
+	myMsg_WaitForDBDisconnect,			// wait for safe database disconnect
+	myMsg_BlockProcessed,				// a block message was processed in the worker thread
+//	myMsg_BlockConfirmed				// a block was pruned from temporary tables to UTXO
+};
 
 enum wthreadtype	// our worker threads
 {
@@ -67,6 +90,7 @@ enum wthreadtype	// our worker threads
 	WT_TxMsg,
 	WT_DBConnect,
 	WT_DBConfirm,
+	WT_DBMultiPrune,
 	WT_LAST			// for bounds checking
 };
 
@@ -220,7 +244,7 @@ enum invtype
 	MSG_BLOCK,
 };
 
-#define BOOST_THREAD_USE_DLL
+// #define BOOST_THREAD_USE_DLL
 
 #include <openssl/buffer.h>
 #include <openssl/ecdsa.h>
@@ -241,6 +265,17 @@ enum invtype
 #include <boost/program_options/detail/config_file.hpp>
 #include <boost/program_options/parsers.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/thread.hpp>
+#include <boost/log/core.hpp>
+#include <boost/log/trivial.hpp>
+//#include <boost/log/expressions.hpp>
+#include <boost/log/sinks/text_file_backend.hpp>
+#include <boost/log/utility/setup/file.hpp>
+#include <boost/log/utility/setup/common_attributes.hpp>
+#include <boost/log/sources/severity_feature.hpp>
+#include <boost/log/sources/severity_logger.hpp>
+
+
 #include <WinSock2.h>
 #include <iterator>
 #include <vector>

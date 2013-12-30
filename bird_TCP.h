@@ -53,6 +53,7 @@ DWORD WINAPI Thread_DoProcessInvMsg(LPVOID lParam);
 DWORD WINAPI Thread_DoProcessBlockMsg(LPVOID lParam);
 DWORD WINAPI Thread_DoProcessTxMsg(LPVOID lParam);
 DWORD WINAPI Thread_DoBlockConfirms(LPVOID lParam);
+DWORD WINAPI Thread_DoMultiBlockPrunes(LPVOID lParam);
 
 // forward declarations of our class names
 class BTCMessage;	// one message of the BTC protocol
@@ -72,7 +73,7 @@ private:
 	char chCommand[BTC_CommandLength];	// 12 chars indicating command, zero padded
 	enum BTCMsgCommands iCommand;		// command text converted to enum type for faster processing once we get the text or vice-versa
 	// next 2 variables only to buffer values of incoming messages, outgoing messages have it calculated on sending it
-	unsigned int iPayloadLen;	// length of actual payload (without checksum length)
+	unsigned int iPayloadLen;			// length of actual payload (without checksum length)
 	unsigned int iPayloadChk;	// checksum of payload = first 4 bytes of sha256(sha256(payload))
 
 // private functions as they should be called only internally
@@ -94,6 +95,7 @@ public:
 	uint64 GetVarInt(std::vector<unsigned char>::iterator &it);		// returns uint64 that was saved as a varint at the indicated iterator position, iterator updated to point after varint
 	void AppendInvVector(int HashType, uint256 &ui);		// appends an inv vector to the payload
 	bool VerifyChecksum(void);								// see if received checksum is valid
+	int GetBlockHeight(void);								// if Msg is 'block' and it is v2, get block height from coinbase info (BIP0034) otherwise set -2
 	friend class BTCtcp;
 };
 
@@ -132,10 +134,12 @@ private:
 	bool bWriteReady;						// socket is ready to accept send() commands
 	std::vector<char> outBuffer;			// our send buffer
 	unsigned int outPos;					// points to first not transmitted char
+	SYSTEMTIME stPing;						// time of last ping message
 
 public:
 	bool bPingTimerSet;
 	int Peer_BlockHeight;					// block height known to other peer (from incoming version msg)
+	int Peer_ProtoVersion;					// protocol version of peer (from incoming version msg)
 	int Peer_AskedBlockHeight;				// highest block height asked to other peer
 	int iTimerPreviousBlockHeight;			// remember blockheight of previous timer event
 	BTCtcp(void);
